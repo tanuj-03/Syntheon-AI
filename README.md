@@ -4,7 +4,7 @@ An intelligent meeting management platform that transforms conversations into so
 
 ## 🚀 Features
 
-### Web Application
+### Web Application.
 
 - **Dashboard**: Central hub for managing meetings, projects, and extracted specifications
 - **Meeting Management**: View and organize meetings with detailed transcripts and metadata
