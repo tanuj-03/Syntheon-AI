@@ -1,0 +1,493 @@
+# SECURITY AUDIT REPORT — Syntheon-AI Codebase
+# Audited: May 3, 2026
+# Auditor: Cascade (automated)
+
+================================================================================
+## EXECUTIVE SUMMARY
+================================================================================
+
+Total vulnerabilities found: 18
+- CRITICAL: 3
+- HIGH: 6
+- MEDIUM: 6
+- LOW: 3
+
+Key risk areas:
+- Stored XSS via unsanitized HTML rendering (Critical)
+- Missing org-level authorization on several endpoints (Critical)
+- IDOR vulnerabilities allowing cross-tenant data access (Critical)
+- No rate limiting on any endpoint (High)
+- GitHub OAuth state parameter is hardcoded (High)
+- Missing Clerk middleware for route protection (High)
+
+================================================================================
+## CRITICAL VULNERABILITIES
+================================================================================
+
+### VULN-001: Stored XSS via dangerouslySetInnerHTML in Comments
+Severity: CRITICAL
+Location: components/ticket-comments-panel.tsx:247
+Description:
+  Comment content is rendered using dangerouslySetInnerHTML without any
+  server-side sanitization. An attacker can inject malicious scripts via
+  the TipTap editor or by crafting raw POST requests to /api/tickets/[id]/comments.
+
+  The only "sanitization" is a client-side regex strip for activity logging:
+    content.replace(/<[^>]*>/g, '') — but the raw HTML is stored in the DB.
+
+Impact:
+  Any authenticated user can inject <script>, <img onerror>, or event handlers
+  that execute in other users' browsers when they view the ticket. This enables
+  session hijacking, data exfiltration, and full account takeover.
+
+Remediation:
+  1. Install DOMPurify: pnpm add dompurify isomorphic-dompurify
+  2. Sanitize on the SERVER before storing:
+     // In app/api/tickets/[id]/comments/route.ts POST handler:
+     import DOMPurify from 'isomorphic-dompurify';
+     const sanitized = DOMPurify.sanitize(content.trim(), {
+       ALLOWED_TAGS: ['p', 'strong', 'em', 'u', 's', 'a', 'ul', 'ol', 'li',
+                      'h1', 'h2', 'h3', 'blockquote', 'code', 'pre', 'br'],
+       ALLOWED_ATTR: ['href', 'target', 'rel'],
+     });
+  3. Also sanitize on render as defense-in-depth:
+     import DOMPurify from 'dompurify';
+     dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(comment.content) }}
+
+References: OWASP XSS Prevention Cheat Sheet
+
+---
+
+### VULN-002: Missing Org Isolation on Meeting DELETE
+Severity: CRITICAL
+Location: app/api/meetings/[id]/route.ts:6-23
+Description:
+  The DELETE endpoint only checks `userId` authentication but does NOT verify
+  that the meeting belongs to the user's org. Any authenticated user can delete
+  ANY meeting by guessing/knowing the meeting ID.
+
+  Similarly affected endpoints:
+  - GET /api/meetings/[id]/specs (line 11-23) — no ownership check
+  - GET /api/meetings/[id]/tickets (line 15-27) — no ownership check
+  - PATCH /api/meetings/[id]/specs (line 25-49) — no ownership check
+  - PATCH /api/meetings/[id]/tickets (line 107-132) — no ownership check
+
+Impact:
+  Cross-tenant data access and destruction. An attacker in Org A can delete
+  meetings, tickets, and specs belonging to Org B.
+
+Remediation:
+  Add org ownership check to all meeting routes:
+    const { userId, orgId } = await auth();
+    if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    const meeting = await getMeetingById(id);
+    if (!meeting || meeting.org_id !== orgId) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 });
+    }
+
+---
+
+### VULN-003: IDOR — Ticket PATCH Fallback Bypasses Org Check
+Severity: CRITICAL
+Location: app/api/tickets/[id]/route.ts:30-31
+Description:
+  The PATCH handler first checks if the ticket belongs to the user's org tickets.
+  If NOT found, it falls back to getTicketById(id) which does a global lookup
+  with NO ownership check:
+    if (!ticket) {
+      ticket = (await getTicketById(id)) ?? undefined;
+    }
+  This means ANY authenticated user can update ANY ticket in the system by
+  providing a valid ticket ID, even if it belongs to another org.
+
+  Same issue in DELETE handler at line 211-212.
+
+Impact:
+  Complete cross-tenant data manipulation. Attacker can change ticket status,
+  title, description, assignee of any ticket in any org.
+
+Remediation:
+  Remove the fallback entirely, OR add org_id validation:
+    if (!ticket) {
+      ticket = (await getTicketById(id)) ?? undefined;
+      if (ticket && ticket.org_id !== orgId) ticket = undefined;
+    }
+
+================================================================================
+## HIGH VULNERABILITIES
+================================================================================
+
+### VULN-004: No Rate Limiting on Any Endpoint
+Severity: HIGH
+Location: All API routes
+Description:
+  There is no rate limiting middleware configured. No middleware.ts file exists
+  at the project root. All endpoints are vulnerable to brute force, enumeration,
+  and denial-of-service attacks.
+
+Impact:
+  - Brute force API key guessing
+  - Meeting transcription abuse (expensive Deepgram/Groq calls)
+  - File upload flooding (storage exhaustion)
+  - Dependency ignore_count manipulation (rapid bypass escalation)
+
+Remediation:
+  1. Create middleware.ts with Clerk's authMiddleware for route protection
+  2. Add rate limiting via Vercel's @vercel/edge-rate-limit or upstash/ratelimit:
+     // middleware.ts
+     import { clerkMiddleware } from '@clerk/nextjs/server';
+     import { Ratelimit } from '@upstash/ratelimit';
+     import { Redis } from '@upstash/redis';
+
+     const ratelimit = new Ratelimit({
+       redis: Redis.fromEnv(),
+       limiter: Ratelimit.slidingWindow(60, '1 m'), // 60 req/min
+     });
+
+---
+
+### VULN-005: GitHub OAuth State Parameter Hardcoded
+Severity: HIGH
+Location: app/api/oauth/github/initiate/route.ts:34
+Description:
+  The OAuth state parameter is hardcoded as 'temp':
+    state: 'temp'
+  The callback does not validate the state parameter at all.
+
+Impact:
+  CSRF attacks on OAuth flow. An attacker can trick a user into connecting
+  the attacker's GitHub account to the victim's Syntheon account, giving
+  the attacker's repos access to the victim's project deployment pipeline.
+
+Remediation:
+  1. Generate a random state per request and store in a short-lived cookie:
+     import { randomUUID } from 'crypto';
+     const state = randomUUID();
+     // Set httpOnly cookie with state value, 5min expiry
+  2. In callback, verify the state cookie matches the state query param.
+
+---
+
+### VULN-006: No Middleware — Unprotected Routes
+Severity: HIGH
+Location: Project root (no middleware.ts exists)
+Description:
+  There is no Clerk middleware configured. While individual API routes call
+  auth(), the app routes (pages) have no server-side protection. Any route
+  not explicitly checking auth in its component can be accessed.
+
+Impact:
+  Unauthenticated users may access app pages that render before client-side
+  auth checks complete (flash of content).
+
+Remediation:
+  Create middleware.ts at project root:
+    import { clerkMiddleware, createRouteMatcher } from '@clerk/nextjs/server';
+    const isPublicRoute = createRouteMatcher([
+      '/', '/sign-in(.*)', '/sign-up(.*)', '/sso-callback',
+      '/how-it-works', '/pricing', '/legal',
+    ]);
+    export default clerkMiddleware(async (auth, req) => {
+      if (!isPublicRoute(req)) await auth.protect();
+    });
+    export const config = { matcher: ['/((?!.*\\..*|_next).*)', '/', '/(api|trpc)(.*)'] };
+
+---
+
+### VULN-007: Meeting Specs/Tickets PATCH — No Ticket Ownership Validation
+Severity: HIGH
+Location: app/api/meetings/[id]/specs/route.ts:31 and app/api/meetings/[id]/tickets/route.ts:113
+Description:
+  The PATCH handlers accept a ticketId in the request body and directly call
+  updateTicketStatus/updateTicketAssignee without verifying:
+  1. The ticket belongs to the given meeting
+  2. The meeting belongs to the authenticated user's org
+
+  An attacker can update ANY ticket by providing its ID in the request body.
+
+Impact:
+  Cross-tenant ticket manipulation via arbitrary ticketId injection.
+
+Remediation:
+  Verify ticketId belongs to the meeting:
+    const meetingTickets = await getTicketsByMeetingId(id);
+    if (!meetingTickets.find(t => t.id === ticketId)) {
+      return NextResponse.json({ error: 'Ticket not in meeting' }, { status: 404 });
+    }
+
+---
+
+### VULN-008: Attachment/Comment Routes — Missing Org Ownership Check
+Severity: HIGH
+Location: app/api/tickets/[id]/attachments/route.ts:18-21 (GET, POST)
+         app/api/tickets/[id]/attachments/[attachmentId]/route.ts:14-17 (DELETE)
+         app/api/tickets/[id]/activities/route.ts:14-17 (GET, POST)
+Description:
+  These routes only check getTicketById(ticketId) which succeeds for ANY ticket
+  regardless of org. There is no ownership verification.
+
+  The comments GET/POST at lines 18/37 DO check `ticket.user_id !== userId`
+  but this is also wrong — it blocks org members from accessing their own
+  org's tickets if they didn't create them.
+
+Impact:
+  Any authenticated user can read/add/delete attachments, comments, and
+  activities on tickets from other organizations.
+
+Remediation:
+  Replace getTicketById with an org-scoped lookup:
+    const { orgId } = await auth();
+    const ticket = await getTicketById(ticketId);
+    if (!ticket || (orgId && ticket.org_id !== orgId)) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 });
+    }
+
+---
+
+### VULN-009: GitHub Token Stored in Plaintext
+Severity: HIGH
+Location: lib/services/integrations/github.ts:10
+Description:
+  GitHub OAuth access tokens are stored as plaintext in the integrations table:
+    github_token: params.githubToken
+  Anyone with database read access can steal all user GitHub tokens.
+
+Impact:
+  If Supabase credentials are compromised or RLS is misconfigured,
+  attacker gets full repo access for every connected user.
+
+Remediation:
+  Encrypt tokens before storage:
+  1. Use AES-256-GCM encryption with a server-side key:
+     import crypto from 'crypto';
+     const ENCRYPTION_KEY = process.env.TOKEN_ENCRYPTION_KEY; // 32-byte hex
+     function encrypt(text: string): string { ... }
+     function decrypt(ciphertext: string): string { ... }
+  2. Store encrypted token, decrypt on read.
+
+================================================================================
+## MEDIUM VULNERABILITIES
+================================================================================
+
+### VULN-010: .gitignore Malformed — .DS_Store Not Properly Ignored
+Severity: MEDIUM
+Location: .gitignore:10
+Description:
+  Line 10 reads: .DS_Storerecordings/*.webm
+  This is malformed — missing a newline between .DS_Store and recordings/*.webm.
+  The .DS_Store file may be committed to git, and recordings/*.webm is not
+  properly gitignored.
+
+Impact:
+  .DS_Store files may leak directory structure. Recording files (meeting audio)
+  could accidentally be committed to the repo.
+
+Remediation:
+  Fix .gitignore:
+    .DS_Store
+    recordings/*.webm
+
+---
+
+### VULN-011: Transcribe Route Writes Files to Server Filesystem
+Severity: MEDIUM
+Location: app/api/transcribe/route.ts:36-41
+Description:
+  Audio files are written directly to the server filesystem:
+    const recordingsDir = path.resolve(process.cwd(), 'recordings');
+    await writeFile(filePath, buffer);
+  On serverless (Vercel), this is ephemeral but on a persistent server this
+  creates unmanaged files that are never cleaned up.
+
+Impact:
+  - Disk space exhaustion on persistent deployments
+  - Potential path traversal if meetingId is manipulated (unlikely since it's
+    generated server-side, but defense-in-depth is missing)
+
+Remediation:
+  1. Stream directly to Supabase Storage or S3 instead of local disk
+  2. Or add cleanup after transcription completes
+  3. Validate that generated filePath contains no traversal characters
+
+---
+
+### VULN-012: Comments GET Route Blocks Org Members
+Severity: MEDIUM
+Location: app/api/tickets/[id]/comments/route.ts:18, 37
+Description:
+  The GET and POST handlers check `ticket.user_id !== userId` which means
+  only the ticket CREATOR can view or add comments. Other org members who
+  are assigned to or collaborating on the ticket cannot access comments.
+
+Impact:
+  Functional bug masquerading as a security check. In a multi-user org,
+  most users cannot see comments on tickets they didn't create.
+
+Remediation:
+  Replace with org-scoped check:
+    if (!ticket || (orgId && ticket.org_id !== orgId)) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 });
+    }
+
+---
+
+### VULN-013: No File Type Validation Beyond Extension
+Severity: MEDIUM
+Location: app/api/upload/route.ts:46
+Description:
+  The upload route accepts the file's self-reported Content-Type without
+  validation. An attacker can upload an .exe or .html file with a crafted
+  Content-Type, which may be served to other users who download it.
+
+Impact:
+  Malware distribution via attachment URLs. If the storage bucket serves
+  files with their uploaded Content-Type, XSS via HTML files is possible.
+
+Remediation:
+  1. Validate file type against an allowlist:
+     const ALLOWED_TYPES = ['image/', 'application/pdf', 'text/', 'video/', 'audio/'];
+     if (!ALLOWED_TYPES.some(t => file.type.startsWith(t))) {
+       return NextResponse.json({ error: 'File type not allowed' }, { status: 400 });
+     }
+  2. Set Content-Disposition: attachment on storage bucket to force download
+  3. Scan files with ClamAV for production deployments
+
+---
+
+### VULN-014: Presigned Upload — No Ticket Ownership Verification
+Severity: MEDIUM
+Location: app/api/upload/presigned/route.ts:16
+Description:
+  The presigned URL endpoint accepts any ticketId without verifying the user
+  has access to that ticket. An attacker can generate upload URLs for any
+  ticket and upload files to other users' tickets.
+
+Impact:
+  Unauthorized file attachment to any ticket in the system.
+
+Remediation:
+  Add ticket ownership check:
+    const ticket = await getTicketById(ticketId);
+    if (!ticket || (orgId && ticket.org_id !== orgId)) {
+      return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+    }
+
+---
+
+### VULN-015: Error Messages Leak Implementation Details
+Severity: MEDIUM
+Location: app/api/transcribe/route.ts:86, app/api/ship/plan/route.ts:111,
+         app/api/ship/execute/route.ts:159, app/api/tickets/[id]/activities/route.ts:24
+Description:
+  Several routes return error.message directly to the client:
+    { error: error instanceof Error ? error.message : 'Failed' }
+  This can leak internal paths, database errors, API key issues, etc.
+
+Impact:
+  Information disclosure that aids attackers in understanding system internals.
+
+Remediation:
+  Never return raw error messages. Log them server-side and return generic errors:
+    console.error('Pipeline error:', error);
+    return NextResponse.json({ error: 'An internal error occurred' }, { status: 500 });
+
+================================================================================
+## LOW VULNERABILITIES
+================================================================================
+
+### VULN-016: localStorage Stores Project Stage Configuration
+Severity: LOW
+Location: components/projects-workspace.tsx:324-367
+Description:
+  Project kanban stage names and ticket-stage mappings are stored in
+  localStorage. While this data is not sensitive, it's accessible to
+  any script running on the same origin.
+
+Impact:
+  If XSS is exploited (VULN-001), an attacker could read/modify kanban
+  configuration. Low impact since it's cosmetic UI state.
+
+Remediation:
+  No action required unless VULN-001 is not fixed. Once XSS is mitigated,
+  localStorage usage for UI state is acceptable.
+
+---
+
+### VULN-017: next.config.mjs Exposes Dev Origin
+Severity: LOW
+Location: next.config.mjs:9
+Description:
+  allowedDevOrigins includes a specific ngrok URL:
+    'uncapacious-lauraceous-verna.ngrok-free.dev'
+  This leaks a development tunnel URL.
+
+Impact:
+  Minimal. The ngrok URL is ephemeral and this config only applies in dev mode.
+
+Remediation:
+  Remove from production builds or use env-conditional:
+    allowedDevOrigins: process.env.NODE_ENV === 'development'
+      ? [process.env.NGROK_URL].filter(Boolean)
+      : [],
+
+---
+
+### VULN-018: TypeScript Build Errors Ignored
+Severity: LOW
+Location: next.config.mjs:3-5
+Description:
+  typescript: { ignoreBuildErrors: true } means type errors won't prevent
+  deployment. This can allow runtime errors that TypeScript would catch.
+
+Impact:
+  Potential runtime crashes from type mismatches in production.
+
+Remediation:
+  Remove this for production builds:
+    typescript: { ignoreBuildErrors: process.env.NODE_ENV === 'development' },
+
+================================================================================
+## SUMMARY OF REMEDIATION PRIORITIES
+================================================================================
+
+IMMEDIATE (fix before shipping to production):
+  1. VULN-001 — Sanitize comment HTML (stored XSS)
+  2. VULN-002 — Add org checks to meeting routes
+  3. VULN-003 — Remove ticket fallback or add org validation
+  4. VULN-006 — Create Clerk middleware.ts
+  5. VULN-007 — Validate ticketId ownership in meeting PATCH routes
+
+SHORT TERM (fix within first sprint):
+  6. VULN-004 — Add rate limiting
+  7. VULN-005 — Fix OAuth state parameter
+  8. VULN-008 — Fix attachment/activity route ownership
+  9. VULN-009 — Encrypt stored tokens
+  10. VULN-012 — Fix comments route authorization logic
+
+LONG TERM (improve before scale):
+  11. VULN-010 — Fix .gitignore
+  12. VULN-011 — Move transcription to cloud storage
+  13. VULN-013 — Add file type allowlist
+  14. VULN-014 — Validate presigned URL ticket ownership
+  15. VULN-015 — Sanitize error messages
+  16-18. Low priority items
+
+================================================================================
+## POSITIVE FINDINGS (things done correctly)
+================================================================================
+
++ Clerk auth() called on all API routes (authentication present)
++ Webhook signature verification uses crypto.timingSafeEqual (timing-safe)
++ Supabase client uses parameterized queries (no SQL injection risk)
++ File paths sanitized with regex before storage upload
++ File size validated server-side (15MB limit)
++ Upload URL route verifies path starts with userId (path traversal prevention)
++ RBAC system properly gates project admin operations (canAdminProject)
++ Project DELETE restricted to org admins only
++ Dependency creation prevents self-references and circular dependencies
++ Environment variables not exposed client-side (SUPABASE_SERVICE_ROLE_KEY is server-only)
++ .env.local is gitignored
+
+================================================================================
+END OF SECURITY AUDIT REPORT
+================================================================================

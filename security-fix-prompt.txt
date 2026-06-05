@@ -1,0 +1,520 @@
+# SECURITY FIX PROMPT — Syntheon-AI
+
+You are a senior security engineer. Fix ALL 18 vulnerabilities identified in the security audit. Follow the remediation steps exactly. Fix them in order of priority (Critical → High → Medium → Low).
+
+---
+
+## CRITICAL FIXES (do these first)
+
+### FIX-001: Sanitize Comment HTML (Stored XSS)
+Severity: CRITICAL
+Location: components/ticket-comments-panel.tsx:247
+
+1. Install DOMPurify:
+   ```bash
+   pnpm add dompurify isomorphic-dompurify
+   ```
+
+2. Add server-side sanitization in app/api/tickets/[id]/comments/route.ts POST:
+   ```typescript
+   import DOMPurify from 'isomorphic-dompurify';
+
+   // After line 44 (content validation):
+   const sanitized = DOMPurify.sanitize(content.trim(), {
+     ALLOWED_TAGS: ['p', 'strong', 'em', 'u', 's', 'a', 'ul', 'ol', 'li',
+                    'h1', 'h2', 'h3', 'blockquote', 'code', 'pre', 'br'],
+     ALLOWED_ATTR: ['href', 'target', 'rel'],
+   });
+
+   // Use sanitized instead of content.trim() in createComment
+   ```
+
+3. Add client-side sanitization in components/ticket-comments-panel.tsx:
+   ```typescript
+   import DOMPurify from 'dompurify';
+
+   // Line 247 - replace dangerouslySetInnerHTML:
+   dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(comment.content) }}
+   ```
+
+---
+
+### FIX-002: Add Org Isolation to Meeting Routes
+Severity: CRITICAL
+Location: app/api/meetings/[id]/route.ts, app/api/meetings/[id]/specs/route.ts, app/api/meetings/[id]/tickets/route.ts
+
+For ALL these routes, add this ownership check after auth:
+```typescript
+const { userId, orgId } = await auth();
+if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+const meeting = await getMeetingById(id);
+if (!meeting || meeting.org_id !== orgId) {
+  return NextResponse.json({ error: 'Not found' }, { status: 404 });
+}
+```
+
+Routes to fix:
+1. app/api/meetings/[id]/route.ts:DELETE (line 6-23)
+2. app/api/meetings/[id]/specs/route.ts:GET (line 11-23)
+3. app/api/meetings/[id]/specs/route.ts:PATCH (line 25-49)
+4. app/api/meetings/[id]/tickets/route.ts:GET (line 15-27)
+5. app/api/meetings/[id]/tickets/route.ts:PATCH (line 107-132)
+6. app/api/meetings/[id]/tickets/route.ts:POST (line 29-105)
+
+---
+
+### FIX-003: Remove Ticket PATCH Fallback
+Severity: CRITICAL
+Location: app/api/tickets/[id]/route.ts:30-31 and 211-212
+
+1. In PATCH handler (around line 30-31), remove the fallback OR add org validation:
+   ```typescript
+   // Replace:
+   if (!ticket) {
+     ticket = (await getTicketById(id)) ?? undefined;
+   }
+
+   // With:
+   if (!ticket) {
+     ticket = (await getTicketById(id)) ?? undefined;
+     if (ticket && ticket.org_id !== orgId) ticket = undefined;
+   }
+   ```
+
+2. In DELETE handler (around line 211-212), apply the same fix.
+
+---
+
+## HIGH FIXES
+
+### FIX-004: Create Middleware with Rate Limiting
+Severity: HIGH
+
+1. Install upstash/ratelimit:
+   ```bash
+   pnpm add @upstash/ratelimit @upstash/redis
+   ```
+
+2. Create middleware.ts at project root:
+   ```typescript
+   import { clerkMiddleware, createRouteMatcher } from '@clerk/nextjs/server';
+   import { Ratelimit } from '@upstash/ratelimit';
+   import { Redis } from '@upstash/redis';
+
+   const isPublicRoute = createRouteMatcher([
+     '/', '/sign-in(.*)', '/sign-up(.*)', '/sso-callback',
+     '/how-it-works', '/pricing', '/legal',
+   ]);
+
+   const ratelimit = new Ratelimit({
+     redis: Redis.fromEnv(),
+     limiter: Ratelimit.slidingWindow(60, '1 m'),
+   });
+
+   export default clerkMiddleware(async (auth, req) => {
+     if (!isPublicRoute(req)) await auth.protect();
+
+     // Rate limit API routes
+     if (req.nextUrl.pathname.startsWith('/api')) {
+       const { success } = await ratelimit.limit(req.ip ?? 'anonymous');
+       if (!success) {
+         return new Response('Too many requests', { status: 429 });
+       }
+     }
+   });
+
+   export const config = {
+     matcher: ['/((?!.*\\..*|_next).*)', '/', '/(api|trpc)(.*)']
+   };
+   ```
+
+3. Add env vars to .env.example:
+   ```
+   UPSTASH_REDIS_REST_URL=
+   UPSTASH_REDIS_REST_TOKEN=
+   ```
+
+---
+
+### FIX-005: Fix OAuth State Parameter
+Severity: HIGH
+Location: app/api/oauth/github/initiate/route.ts:34
+
+1. In app/api/oauth/github/initiate/route.ts POST:
+   ```typescript
+   import { randomUUID } from 'crypto';
+   import { cookies } from 'next/headers';
+
+   const state = randomUUID();
+   cookies().set('oauth_state', state, {
+     httpOnly: true,
+     secure: true,
+     sameSite: 'lax',
+     maxAge: 300, // 5 minutes
+   });
+
+   // Replace state: 'temp' with state: state
+   ```
+
+2. In app/api/oauth/github/callback/route.ts GET (line 20-38):
+   ```typescript
+   const { searchParams } = new URL(req.url);
+   const state = searchParams.get('state');
+   const storedState = cookies().get('oauth_state')?.value;
+
+   if (!state || state !== storedState) {
+     const redirectUrl = getSettingsRedirectUrl(req);
+     redirectUrl.searchParams.set('github_error', 'invalid_state');
+     return NextResponse.redirect(redirectUrl);
+   }
+
+   // Clear cookie after validation
+   cookies().delete('oauth_state');
+   ```
+
+---
+
+### FIX-006: Clerk Middleware Already Created in FIX-004
+(Already covered by FIX-004)
+
+---
+
+### FIX-007: Validate TicketId in Meeting PATCH Routes
+Severity: HIGH
+Location: app/api/meetings/[id]/specs/route.ts:31, app/api/meetings/[id]/tickets/route.ts:113
+
+In both PATCH handlers, add this before updateTicketStatus/updateTicketAssignee:
+```typescript
+const meetingTickets = await getTicketsByMeetingId(id);
+if (!meetingTickets.find(t => t.id === ticketId)) {
+  return NextResponse.json({ error: 'Ticket not in meeting' }, { status: 404 });
+}
+```
+
+---
+
+### FIX-008: Fix Attachment/Activity Route Ownership
+Severity: HIGH
+Location: app/api/tickets/[id]/attachments/route.ts, app/api/tickets/[id]/activities/route.ts
+
+In GET/POST handlers (lines 18-21 for attachments, 14-17 for activities), replace:
+```typescript
+const ticket = await getTicketById(ticketId);
+if (!ticket) {
+  return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+}
+```
+
+With:
+```typescript
+const { orgId } = await auth();
+const ticket = await getTicketById(ticketId);
+if (!ticket || (orgId && ticket.org_id !== orgId)) {
+  return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+}
+```
+
+Also fix app/api/tickets/[id]/attachments/[attachmentId]/route.ts:14-17 (DELETE) with the same pattern.
+
+---
+
+### FIX-009: Encrypt GitHub Tokens
+Severity: HIGH
+Location: lib/services/integrations/github.ts
+
+1. Create lib/crypto.ts:
+   ```typescript
+   import crypto from 'crypto';
+
+   const ALGORITHM = 'aes-256-gcm';
+   const KEY_LENGTH = 32;
+   const IV_LENGTH = 16;
+   const AUTH_TAG_LENGTH = 16;
+
+   function getKey(): Buffer {
+     const key = process.env.TOKEN_ENCRYPTION_KEY;
+     if (!key) throw new Error('TOKEN_ENCRYPTION_KEY not set');
+     if (key.length !== KEY_LENGTH * 2) {
+       throw new Error('TOKEN_ENCRYPTION_KEY must be 64 hex characters');
+     }
+     return Buffer.from(key, 'hex');
+   }
+
+   export function encrypt(text: string): string {
+     const iv = crypto.randomBytes(IV_LENGTH);
+     const cipher = crypto.createCipheriv(ALGORITHM, getKey(), iv);
+     let encrypted = cipher.update(text, 'utf8', 'hex');
+     encrypted += cipher.final('hex');
+     const authTag = cipher.getAuthTag();
+     return `${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted}`;
+   }
+
+   export function decrypt(ciphertext: string): string {
+     const [ivHex, authTagHex, encrypted] = ciphertext.split(':');
+     const iv = Buffer.from(ivHex, 'hex');
+     const authTag = Buffer.from(authTagHex, 'hex');
+     const decipher = crypto.createDecipheriv(ALGORITHM, getKey(), iv);
+     decipher.setAuthTag(authTag);
+     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+     decrypted += decipher.final('utf8');
+     return decrypted;
+   }
+   ```
+
+2. Update lib/services/integrations/github.ts:
+   ```typescript
+   import { encrypt, decrypt } from '@/lib/crypto';
+
+   export async function saveGithubIntegration(params: {
+     userId: string;
+     githubToken: string;
+     githubOwner: string;
+   }) {
+     const { error } = await supabaseAdmin.from('integrations').upsert(
+       {
+         user_id: params.userId,
+         github_token: encrypt(params.githubToken),
+         github_owner: params.githubOwner,
+         updated_at: new Date().toISOString(),
+       },
+       { onConflict: 'user_id' }
+     );
+     if (error) throw error;
+   }
+   ```
+
+3. Update lib/services/integrations/read.ts:
+   ```typescript
+   import { decrypt } from '@/lib/crypto';
+
+   export function getGithubToken(integration: IntegrationRow): string | null {
+     if (!integration) return null;
+     const token = integration.github_token || integration.github_access_token || null;
+     return token ? decrypt(token) : null;
+   }
+   ```
+
+4. Add to .env.example:
+   ```
+   TOKEN_ENCRYPTION_KEY=<64-hex-char-random-key>
+   ```
+
+---
+
+## MEDIUM FIXES
+
+### FIX-010: Fix .gitignore
+Severity: LOW/MEDIUM
+Location: .gitignore:10
+
+Replace line 10:
+```
+.DS_Storerecordings/*.webm
+```
+
+With:
+```
+.DS_Store
+recordings/*.webm
+```
+
+---
+
+### FIX-011: Move Transcription to Cloud Storage
+Severity: MEDIUM
+Location: app/api/transcribe/route.ts:36-41
+
+Replace filesystem write with Supabase Storage upload:
+```typescript
+// Remove lines 36-41 (local filesystem write)
+
+// Replace with Supabase Storage upload:
+const timestamp = Date.now();
+const filePath = `${userId}/${meetingId}/${timestamp}_audio.webm`;
+const { error: uploadError } = await supabaseAdmin.storage
+  .from('meeting-audio')
+  .upload(filePath, audioFile, { contentType: 'audio/webm' });
+
+if (uploadError) {
+  console.error('Storage upload error:', uploadError);
+  return NextResponse.json({ error: 'Failed to upload audio' }, { status: 500 });
+}
+
+// Update meeting file_path to the storage path
+await saveMeeting({
+  // ... other fields
+  filePath,
+});
+```
+
+---
+
+### FIX-012: Fix Comments Route Authorization
+Severity: MEDIUM
+Location: app/api/tickets/[id]/comments/route.ts:18, 37
+
+Replace the user_id check with org_id check in both GET and POST:
+```typescript
+// Replace:
+if (!ticket || ticket.user_id !== userId) {
+  return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+}
+
+// With:
+if (!ticket || (orgId && ticket.org_id !== orgId)) {
+  return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+}
+```
+
+---
+
+### FIX-013: Add File Type Validation
+Severity: MEDIUM
+Location: app/api/upload/route.ts:46
+
+Add after file validation (after line 36):
+```typescript
+const ALLOWED_TYPES = ['image/', 'application/pdf', 'text/', 'video/', 'audio/'];
+if (!ALLOWED_TYPES.some(t => file.type.startsWith(t))) {
+  return NextResponse.json({ error: 'File type not allowed' }, { status: 400 });
+}
+```
+
+---
+
+### FIX-014: Validate Presigned URL Ticket Ownership
+Severity: MEDIUM
+Location: app/api/upload/presigned/route.ts:16
+
+Add after filename/ticketId validation:
+```typescript
+const ticket = await getTicketById(ticketId);
+if (!ticket || (orgId && ticket.org_id !== orgId)) {
+  return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+}
+```
+
+---
+
+### FIX-015: Sanitize Error Messages
+Severity: MEDIUM
+Location: Multiple routes
+
+Replace all instances of:
+```typescript
+{ error: error instanceof Error ? error.message : 'Failed to ...' }
+```
+
+With:
+```typescript
+// Log server-side
+console.error('Operation failed:', error);
+// Return generic message
+{ error: 'An internal error occurred' }
+```
+
+Affected routes:
+- app/api/transcribe/route.ts:86
+- app/api/ship/plan/route.ts:111
+- app/api/ship/execute/route.ts:159
+- app/api/tickets/[id]/activities/route.ts:24
+
+---
+
+## LOW FIXES
+
+### FIX-016: localStorage (No action needed if XSS fixed)
+Severity: LOW
+Location: components/projects-workspace.tsx:324-367
+
+No action required — this is only a risk if VULN-001 (XSS) is not fixed. Once XSS is mitigated, localStorage usage for UI state is acceptable.
+
+---
+
+### FIX-017: Remove Dev Origin from Production
+Severity: LOW
+Location: next.config.mjs:9
+
+Replace:
+```typescript
+allowedDevOrigins: ['uncapacious-lauraceous-verna.ngrok-free.dev']
+```
+
+With:
+```typescript
+allowedDevOrigins: process.env.NODE_ENV === 'development'
+  ? [process.env.NGROK_URL].filter(Boolean)
+  : [],
+```
+
+---
+
+### FIX-018: Remove TypeScript Error Ignore in Production
+Severity: LOW
+Location: next.config.mjs:3-5
+
+Replace:
+```typescript
+typescript: { ignoreBuildErrors: true }
+```
+
+With:
+```typescript
+typescript: { ignoreBuildErrors: process.env.NODE_ENV === 'development' }
+```
+
+---
+
+## ENVIRONMENT VARIABLES TO ADD
+
+Add these to .env.example:
+```
+# Rate limiting (Upstash Redis)
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
+
+# Token encryption (generate with: openssl rand -hex 32)
+TOKEN_ENCRYPTION_KEY=
+
+# Optional: Dev tunnel URL
+NGROK_URL=
+```
+
+---
+
+## VERIFICATION STEPS
+
+After all fixes:
+1. Run `pnpm build` — should succeed with no TypeScript errors
+2. Run `npx tsc --noEmit` — should have no errors
+3. Test authentication flow
+4. Test comment creation (XSS should be sanitized)
+5. Test org isolation (users cannot access other orgs' data)
+6. Test file uploads (blocked types rejected)
+7. Test OAuth flow (state validation works)
+
+---
+
+## ORDER OF IMPLEMENTATION
+
+1. FIX-001 (XSS) — Critical
+2. FIX-002 (Meeting org checks) — Critical
+3. FIX-003 (Ticket fallback) — Critical
+4. FIX-007 (Meeting PATCH ticketId) — Critical
+5. FIX-008 (Attachment/Activity ownership) — Critical
+6. FIX-004 (Middleware + rate limiting) — High
+7. FIX-005 (OAuth state) — High
+8. FIX-009 (Token encryption) — High
+9. FIX-012 (Comments auth) — Medium
+10. FIX-010 (.gitignore) — Medium
+11. FIX-014 (Presigned URL ownership) — Medium
+12. FIX-013 (File type validation) — Medium
+13. FIX-015 (Error sanitization) — Medium
+14. FIX-011 (Cloud storage) — Medium
+15. FIX-017 (Dev origin) — Low
+16. FIX-018 (TS errors) — Low
+17. FIX-016 (localStorage) — Low (no action needed)
+
+---
+
+Fix ALL vulnerabilities. Test thoroughly. Ensure no regressions.

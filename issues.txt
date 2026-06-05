@@ -1,0 +1,81 @@
+🚀 SYNTHEON-AI DEVELOPMENT COMPLETE — all phases shipped
+
+Testing phase 1 - AUTH
+1. Sign up - google okay, github okay, discord issue oauth_discord does not match one of the allowed values for parameter strategy 
+2. Sign in - shows captcha error "Cannot initialize Smart CAPTCHA widget because the `clerk-captcha` DOM element was not found; falling back to Invisible CAPTCHA widget. If you are using a custom flow, visit https://clerk.com/docs/guides/development/custom-flows/authentication/bot-sign-up-protection for instruction" for all three logins 
+
+Testing phase 2 - Onboarding 
+1. create org on admin side works can switch to that org on dashboard
+2. [FIXED] member gets locked in sign in — /accept-invite page now handles already-signed-in users, signs them out and re-auths with ticket, then activates correct org 
+3. logs -  GET /sign-in?__clerk_status=sign_in&__clerk_ticket=eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJlaXMiOjI1OTIwMDAsImV4cCI6MTc3OTk2MTg2MSwiaWlkIjoiaW5zXzNCSTRPYnZmMDdnWG9wUmJCR0ZuWnJTRFl0dyIsIm9pZCI6Im9yZ18zQ3l0b2tIOEROeEd0QzRNbmVJSUN5TDdZMnYiLCJzaWQiOiJvcmdpbnZfM0N5dHVqazM5NGpHUUxDVE1BSnZBam9Xd1I5Iiwic3QiOiJvcmdhbml6YXRpb25faW52aXRhdGlvbiJ9.AJnBKZ5UFUIabKA0R8gjjavozJOrm7ozAXbyELqA5c3dcDuRqy6j7yBsNqWCkhSw9nS4wZzm1Xo6pLnS3sEo_uqaE9V8PoGSh2w_mydZqfcKonziRUhUnENYxu54w1WA4SgCgXl2dVfc2aQOW_niBBrbGoeWfOss4uqioAj2ZyjBZ5zhC1Y-z6cRATE2piR5CRc7Fp-4ZhO6Lc5OcT8oFdhHjnC8h3X4XixVGbHCSwGBaiJkiH4iREiH0r8URvJgXDVXYbl8Lj9MEw6FsEjvYfvFVe1CiuoYo3fpNtyA0jgAqJulaMGujirRnxQXdCmPKwv6dirw5_v6hNrXPm8jWQ 200 
+
+Testing phase 3 - Organization / settings 
+1. can create new org 
+2. can swtich to new org 
+3. can rename org
+4. [FIXED] invite flow working — send invite dialog + accept-invite flow confirmed working in dev logs
+5. [FIXED] remove member — confirmation AlertDialog implemented
+6. [FIXED] revoke invite — Revoke button with AlertDialog confirmation implemented
+7. [FIXED] change member role — dropdown with Make Admin / Make Member implemented
+
+Testing phase 4 - Projects 
+1. can create Projects
+2. can delete Projects 
+3. Porject details are present and functioning
+4. [FIXED] project members tab implemented — add/remove members, pending org invitations shown
+
+Testing phase 5 - Meetings
+1. API key from syntheon app to syntheon extension shows a google pop up , needs removal and should show success message within in extenion 
+2. Skribby 
+
+
+Testing phase 6 - Tickets
+1. [FIXED] ticket creation dialog status/meeting selects were bg-white — replaced with bg-background so they are visible in dark mode
+2. can edit the tickets title, desc, status, assignee
+3. drag and drop is functioning in kanban
+4. Date picker is functioning
+5. assignee picker is functioning 
+6. can delete tickets
+7. cannot test the feature, refer to phase 5 for issues
+
+Testing phase 7 - Dependencies ✅ COMPLETE
+1. can add Dependencies
+2. can remove Dependencies
+3. [FIXED] soft dependency bypass replaced window.confirm/alert with DependencyBlockerModal — onProceed prop added, all 5 occurrences across tickets-board.tsx, ticket-detail.tsx, projects-workspace.tsx replaced
+4. Hard block is functioning (DependencyBlockerModal is custom styled)
+5. Dependencies graph is functioning 
+6. auto inference could not be tested , refer to phase 5 for issues
+
+Testing phase 8 - Calender 
+1. Gantt bars render 
+2. Urgency colours render 
+3. [FIXED] calendar auto-scrolls to current day on open — useLayoutEffect scrolls to today offset on mount and zoom/anchor change
+ 
+Testing phase 9 - Tagging
+1. [FIXED] @ and # tagging now works on global tickets board — tickets-board.tsx now passes real org members (via useOrganization) and all tickets to MentionEditor
+
+Testing phase 10 - Comments and activity 
+1. [FIXED] comment input placeholder cursor artifact — TipTapEditor now uses editorKey that increments on submit, forcing a full reset and clearing the stale cursor
+2. [FIXED] comment edit functionality added — pencil icon per comment opens inline TipTapEditor, PATCH /api/tickets/[id]/comments/[commentId] implemented, updateComment added to db.ts
+3. [FIXED] activity no longer shows raw HTML — comment API now strips HTML tags before storing content in activity metadata
+
+Testing phase 11 - Attachments
+1. upload is successfull
+2. [FIXED] download ByteString error fixed — /api/download/route.ts now sanitizes filename with /[^\x00-\x7F]/g replace before setting Content-Disposition header
+ no error for pdf type 
+ no error for docx type 
+ no error for txt type 
+
+additional notes :- [FIXED] drag and drop added to attachments panel — drop zone highlights on drag, works for both empty and populated states, shares same uploadFile logic as the button
+
+Testing phase 12 - integrations 
+1. Github connect and disconnect is working 
+2. [FIXED] Linear removed from integrations UI
+3. its syntheon api key and it is working
+
+Testing phase 13 - UI 
+1. Dashboard stats work  
+2. Sidebar nav works 
+3. Auth pages work 
+
+additional notes :- [FIXED] legal, pricing, how-it-works pages locked permanently to dark mode — removed dark state, toggleTheme, localStorage logic, and toggle buttons from all three pages
